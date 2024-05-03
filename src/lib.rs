@@ -5,9 +5,9 @@
 use cortex_m::peripheral::{syst::SystClkSource, DCB, DWT, SYST};
 pub use fugit;
 #[cfg(not(feature = "extend"))]
-pub use fugit::ExtU32;
+pub use fugit::{ExtU32, TimerDurationU32 as TimerDuration, TimerInstantU32 as TimerInstant};
 #[cfg(feature = "extend")]
-pub use fugit::ExtU64;
+pub use fugit::{ExtU64, TimerDurationU64 as TimerDuration, TimerInstantU64 as TimerInstant};
 use rtic_monotonic::Monotonic;
 
 /// DWT and Systick combination implementing `rtic_monotonic::Monotonic`.
@@ -25,8 +25,8 @@ use rtic_monotonic::Monotonic;
 /// When the `extend` feature is enabled, the cycle counter width is extended to
 /// `u64` by detecting and counting overflows.
 pub struct DwtSystick<const TIMER_HZ: u32> {
-    dwt: DWT,
     systick: SYST,
+    cycle_offset: TimerInstant<TIMER_HZ>,
     #[cfg(feature = "extend")]
     last: u64,
 }
@@ -51,38 +51,23 @@ impl<const TIMER_HZ: u32> DwtSystick<TIMER_HZ> {
 
         systick.set_clock_source(SystClkSource::Core);
 
-        // We do not start the counters here but in `reset()`.
+        // Start the counter
+        systick.enable_counter();
+        dwt.enable_cycle_counter();
 
         DwtSystick {
-            dwt,
             systick,
+            cycle_offset: TimerInstant::from_ticks(0),
             #[cfg(feature = "extend")]
             last: 0,
         }
     }
-}
 
-impl<const TIMER_HZ: u32> Monotonic for DwtSystick<TIMER_HZ> {
-    cfg_if::cfg_if! {
-        if #[cfg(not(feature = "extend"))] {
-            const DISABLE_INTERRUPT_ON_EMPTY_QUEUE: bool = true;
-
-            type Instant = fugit::TimerInstantU32<TIMER_HZ>;
-            type Duration = fugit::TimerDurationU32<TIMER_HZ>;
-
-            #[inline(always)]
-            fn now(&mut self) -> Self::Instant {
-                Self::Instant::from_ticks(DWT::cycle_count())
-            }
-        } else {
-            // Need to detect and track overflows.
-            const DISABLE_INTERRUPT_ON_EMPTY_QUEUE: bool = false;
-
-            type Instant = fugit::TimerInstantU64<TIMER_HZ>;
-            type Duration = fugit::TimerDurationU64<TIMER_HZ>;
-
-            #[inline(always)]
-            fn now(&mut self) -> Self::Instant {
+    pub fn unadjusted_now(&mut self) -> TimerInstant<TIMER_HZ> {
+        cfg_if::cfg_if! {
+            if #[cfg(not(feature = "extend"))] {
+                TimerInstant::from_ticks(DWT::cycle_count())
+            } else {
                 let mut high = (self.last >> 32) as u32;
                 let low = self.last as u32;
                 let now = DWT::cycle_count();
@@ -93,17 +78,34 @@ impl<const TIMER_HZ: u32> Monotonic for DwtSystick<TIMER_HZ> {
                 }
                 self.last = ((high as u64) << 32) | (now as u64);
 
-                Self::Instant::from_ticks(self.last)
+                TimerInstant::from_ticks(self.last)
             }
         }
     }
 
-    unsafe fn reset(&mut self) {
-        self.systick.enable_counter();
+    pub fn adjusted_now(&mut self) -> TimerInstant<TIMER_HZ> {
+        let unadjusted_now = self.unadjusted_now();
+        TimerInstant::from_ticks(unadjusted_now.ticks() - self.cycle_offset.ticks())
+    }
+}
 
-        // Enable and reset the cycle counter to locate the epoch.
-        self.dwt.enable_cycle_counter();
-        self.dwt.set_cycle_count(0);
+impl<const TIMER_HZ: u32> Monotonic for DwtSystick<TIMER_HZ> {
+    #[cfg(feature = "extend")]
+    const DISABLE_INTERRUPT_ON_EMPTY_QUEUE: bool = true;
+    #[cfg(not(feature = "extend"))]
+    // Need to detect and track overflows.
+    const DISABLE_INTERRUPT_ON_EMPTY_QUEUE: bool = false;
+
+    type Instant = TimerInstant<TIMER_HZ>;
+    type Duration = TimerDuration<TIMER_HZ>;
+
+    #[inline(always)]
+    fn now(&mut self) -> Self::Instant {
+        self.adjusted_now()
+    }
+
+    unsafe fn reset(&mut self) {
+        self.cycle_offset = self.unadjusted_now();
     }
 
     fn set_compare(&mut self, val: Self::Instant) {
