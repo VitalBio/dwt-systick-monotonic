@@ -101,7 +101,7 @@ impl<const TIMER_HZ: u32> Monotonic for DwtSystick<TIMER_HZ> {
 
     #[inline(always)]
     fn now(&mut self) -> Self::Instant {
-        self.adjusted_now()
+        self.unadjusted_now()
     }
 
     unsafe fn reset(&mut self) {
